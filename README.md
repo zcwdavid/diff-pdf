@@ -20,6 +20,13 @@ highlighted differences:
 $ diff-pdf --output-diff=diff.pdf a.pdf b.pdf
 ```
 
+If you prefer a Git-style before/after comparison, combine `--output-diff` with
+`--side-by-side` to place the original pages next to each other in the output:
+
+```
+$ diff-pdf --output-diff=diff.pdf --side-by-side a.pdf b.pdf
+```
+
 Another option is to compare the two files visually in a simple GUI, using
 the `--view` argument:
 

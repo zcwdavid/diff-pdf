@@ -52,6 +52,7 @@ bool g_mark_differences = false;
 long g_channel_tolerance = 0;
 long g_per_page_pixel_tolerance = 0;
 bool g_grayscale = false;
+bool g_side_by_side = false;
 // Resolution to use for rasterization, in DPI
 #define DEFAULT_RESOLUTION 300
 long g_resolution = DEFAULT_RESOLUTION;
@@ -332,6 +333,51 @@ cairo_surface_t *diff_images(int page, cairo_surface_t *s1, cairo_surface_t *s2,
 }
 
 
+cairo_surface_t *compose_side_by_side(cairo_surface_t *s1, cairo_surface_t *s2)
+{
+    assert( s1 || s2 );
+
+    const int width1 = s1 ? cairo_image_surface_get_width(s1) : 0;
+    const int height1 = s1 ? cairo_image_surface_get_height(s1) : 0;
+    const int width2 = s2 ? cairo_image_surface_get_width(s2) : 0;
+    const int height2 = s2 ? cairo_image_surface_get_height(s2) : 0;
+
+    const int separator_width = (s1 && s2) ? 10 : 0;
+    const int width = width1 + separator_width + width2;
+    const int height = std::max(height1, height2);
+
+    cairo_surface_t *combined =
+        cairo_image_surface_create(CAIRO_FORMAT_RGB24, width, height);
+
+    cairo_t *cr = cairo_create(combined);
+    cairo_set_source_rgb(cr, 1, 1, 1);
+    cairo_paint(cr);
+
+    if ( s1 )
+    {
+        cairo_set_source_surface(cr, s1, 0, 0);
+        cairo_paint(cr);
+    }
+
+    if ( s2 )
+    {
+        cairo_set_source_surface(cr, s2, width1 + separator_width, 0);
+        cairo_paint(cr);
+    }
+
+    if ( separator_width )
+    {
+        cairo_set_source_rgb(cr, 0.82, 0.82, 0.82);
+        cairo_rectangle(cr, width1, 0, separator_width, height);
+        cairo_fill(cr);
+    }
+
+    cairo_destroy(cr);
+
+    return combined;
+}
+
+
 // Compares given two pages. If cr_out is not NULL, then the diff image (either
 // differences or unmodified page, if there are no diffs) is drawn to it.
 // If thumbnail and thumbnail_width are specified, then a thumbnail with
@@ -347,16 +393,27 @@ bool page_compare(int page, cairo_t *cr_out,
                                         thumbnail, thumbnail_width);
     const bool has_diff = (diff != NULL);
 
+    cairo_surface_t *output_surface = NULL;
+    if ( g_side_by_side )
+    {
+        if ( !g_skip_identical || has_diff || !cr_out )
+            output_surface = compose_side_by_side(img1, img2);
+    }
+    else if ( diff )
+        output_surface = diff;
+    else
+        output_surface = img1;
+
     if ( cr_out )
     {
-        if ( diff )
+        if ( output_surface )
         {
             // render the difference as high-resolution bitmap
 
             cairo_save(cr_out);
             cairo_scale(cr_out, 72.0 / g_resolution, 72.0 / g_resolution);
 
-            cairo_set_source_surface(cr_out, diff ? diff : img1, 0, 0);
+            cairo_set_source_surface(cr_out, output_surface, 0, 0);
             cairo_paint(cr_out);
 
             cairo_restore(cr_out);
@@ -371,9 +428,12 @@ bool page_compare(int page, cairo_t *cr_out,
                poppler_page_render(page1, cr_out);
         }
 
-        if (diff || !g_skip_identical)
+        if ( output_surface || !g_skip_identical)
             cairo_show_page(cr_out);
     }
+
+    if ( output_surface && output_surface != diff && output_surface != img1 && output_surface != img2 )
+        cairo_surface_destroy(output_surface);
 
     if ( diff )
         cairo_surface_destroy(diff);
@@ -405,8 +465,17 @@ bool doc_compare(PopplerDocument *doc1, PopplerDocument *doc2,
 
     if ( pdf_output )
     {
-        double w, h;
-        poppler_page_get_size(poppler_document_get_page(doc1, 0), &w, &h);
+        double w1 = 0, h1 = 0, w2 = 0, h2 = 0;
+        if ( poppler_document_get_n_pages(doc1) > 0 )
+            poppler_page_get_size(poppler_document_get_page(doc1, 0), &w1, &h1);
+        if ( poppler_document_get_n_pages(doc2) > 0 )
+            poppler_page_get_size(poppler_document_get_page(doc2, 0), &w2, &h2);
+
+        const double separator = g_side_by_side && w1 > 0 && w2 > 0
+                                 ? 72.0 * 10.0 / g_resolution
+                                 : 0.0;
+        const double w = g_side_by_side ? (w1 + w2 + separator) : (w1 > 0 ? w1 : w2);
+        const double h = std::max(h1, h2);
         surface_out = cairo_pdf_surface_create(pdf_output, w, h);
         cr_out = cairo_create(surface_out);
     }
@@ -439,8 +508,17 @@ bool doc_compare(PopplerDocument *doc1, PopplerDocument *doc2,
 
         if ( pdf_output && page != 0 )
         {
-            double w, h;
-            poppler_page_get_size(poppler_document_get_page(doc1, page), &w, &h);
+            double w1 = 0, h1 = 0, w2 = 0, h2 = 0;
+            if ( page < pages1 )
+                poppler_page_get_size(poppler_document_get_page(doc1, page), &w1, &h1);
+            if ( page < pages2 )
+                poppler_page_get_size(poppler_document_get_page(doc2, page), &w2, &h2);
+
+            const double separator = g_side_by_side && w1 > 0 && w2 > 0
+                                     ? 72.0 * 10.0 / g_resolution
+                                     : 0.0;
+            const double w = g_side_by_side ? (w1 + w2 + separator) : (w1 > 0 ? w1 : w2);
+            const double h = std::max(h1, h2);
             cairo_pdf_surface_set_size(surface_out, w, h);
         }
 
@@ -921,6 +999,9 @@ int main(int argc, char *argv[])
         { wxCMD_LINE_SWITCH,
                   NULL, "view", "view the differences in a window" },
 
+        { wxCMD_LINE_SWITCH,
+                  NULL, "side-by-side", "output rasterized pages side-by-side instead of overlaying them" },
+
         { wxCMD_LINE_PARAM,
                   NULL, NULL, "file1.pdf", wxCMD_LINE_VAL_STRING },
         { wxCMD_LINE_PARAM,
@@ -954,6 +1035,9 @@ int main(int argc, char *argv[])
 
     if ( parser.Found("grayscale") )
         g_grayscale = true;
+
+    if ( parser.Found("side-by-side") )
+        g_side_by_side = true;
 
     wxFileName file1(parser.GetParam(0));
     wxFileName file2(parser.GetParam(1));
