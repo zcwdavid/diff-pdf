@@ -22,7 +22,8 @@ $ diff-pdf --output-diff=diff.pdf a.pdf b.pdf
 
 If you prefer a Git-style before/after comparison, combine `--output-diff` with
 `--side-by-side` to place the original pages next to each other in the output
-and draw red boxes around the detected difference regions on both pages:
+and draw semi-transparent red highlights over the detected difference regions
+on both pages:
 
 ```
 $ diff-pdf --output-diff=diff.pdf --side-by-side a.pdf b.pdf

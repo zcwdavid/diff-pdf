@@ -456,8 +456,7 @@ static void draw_diff_regions(cairo_t *cr,
                               int x_offset)
 {
     cairo_save(cr);
-    cairo_set_source_rgb(cr, 1, 0, 0);
-    cairo_set_line_width(cr, 3.0);
+    cairo_set_line_width(cr, 2.0);
 
     for ( std::vector<wxRect>::const_iterator it = regions.begin(); it != regions.end(); ++it )
     {
@@ -466,6 +465,9 @@ static void draw_diff_regions(cairo_t *cr,
                         it->y + 0.5,
                         it->width,
                         it->height);
+        cairo_set_source_rgba(cr, 1.0, 0.0, 0.0, 0.22);
+        cairo_fill_preserve(cr);
+        cairo_set_source_rgba(cr, 0.85, 0.0, 0.0, 0.9);
         cairo_stroke(cr);
     }
 
@@ -1148,7 +1150,7 @@ int main(int argc, char *argv[])
                   NULL, "view", "view the differences in a window" },
 
         { wxCMD_LINE_SWITCH,
-                  NULL, "side-by-side", "output rasterized pages side-by-side and mark differing regions with red boxes" },
+                  NULL, "side-by-side", "output rasterized pages side-by-side and highlight differing regions with semi-transparent red overlays" },
 
         { wxCMD_LINE_PARAM,
                   NULL, NULL, "file1.pdf", wxCMD_LINE_VAL_STRING },
