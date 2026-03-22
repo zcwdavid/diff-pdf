@@ -29,6 +29,15 @@ on both pages:
 $ diff-pdf --output-diff=diff.pdf --side-by-side a.pdf b.pdf
 ```
 
+
+For PLC-style PDFs that contain multiple worksheets on a single page, you can ask diff-pdf to split every detected worksheet header (`POU:..., 工作单:...`) into its own virtual page, align worksheets with the same name across both files, pad missing worksheets with blank pages, and optionally prepend a worksheet table of contents to the generated diff PDF:
+
+```
+$ diff-pdf --align-worksheets --worksheet-toc --output-diff=diff.pdf --side-by-side a.pdf b.pdf
+```
+
+With this mode, the comparison order is driven by the worksheet names discovered in the second PDF first and then any additional worksheet names that only exist in the first PDF.
+
 Another option is to compare the two files visually in a simple GUI, using
 the `--view` argument:
 

@@ -23,6 +23,9 @@
 #include <stdio.h>
 #include <assert.h>
 
+#include <algorithm>
+#include <map>
+#include <set>
 #include <vector>
 
 #include <glib.h>
@@ -41,6 +44,7 @@
 #include <wx/artprov.h>
 #include <wx/progdlg.h>
 #include <wx/filesys.h>
+#include <wx/tokenzr.h>
 
 // ------------------------------------------------------------------------
 // PDF rendering functions
@@ -53,9 +57,38 @@ long g_channel_tolerance = 0;
 long g_per_page_pixel_tolerance = 0;
 bool g_grayscale = false;
 bool g_side_by_side = false;
+bool g_align_worksheets = false;
+bool g_add_worksheet_toc = false;
 // Resolution to use for rasterization, in DPI
 #define DEFAULT_RESOLUTION 300
 long g_resolution = DEFAULT_RESOLUTION;
+
+struct VirtualPage
+{
+    PopplerPage *source_page;
+    bool is_blank;
+    double page_width;
+    double page_height;
+    double clip_x;
+    double clip_y;
+    double clip_width;
+    double clip_height;
+    wxString label;
+
+    VirtualPage()
+        : source_page(NULL),
+          is_blank(true),
+          page_width(612.0),
+          page_height(792.0),
+          clip_x(0.0),
+          clip_y(0.0),
+          clip_width(612.0),
+          clip_height(792.0)
+    {
+    }
+};
+
+typedef std::vector<VirtualPage> VirtualDocument;
 
 struct DiffRegions
 {
@@ -63,9 +96,197 @@ struct DiffRegions
     std::vector<wxRect> page2;
 };
 
+static wxString normalize_worksheet_label(const wxString& line)
+{
+    wxString normalized(line);
+    normalized.Replace("：", ":");
+    normalized.Replace("\t", " ");
+    while ( normalized.Replace("  ", " ") ) {}
+    return normalized.Trim(true).Trim(false);
+}
+
+static bool is_worksheet_header(const wxString& line)
+{
+    const wxString normalized = normalize_worksheet_label(line);
+    return normalized.Find("POU:") != wxNOT_FOUND &&
+           normalized.Find("工作单:") != wxNOT_FOUND;
+}
+
+static wxRect2DDouble char_range_bounds(PopplerRectangle *rects, guint rect_count,
+                                        int first_char, int last_char)
+{
+    bool found = false;
+    double left = 0, top = 0, right = 0, bottom = 0;
+    const int begin = std::max(0, first_char);
+    const int end = std::min((int)rect_count, last_char);
+    for ( int i = begin; i < end; ++i )
+    {
+        const PopplerRectangle& r = rects[i];
+        if ( r.x2 <= r.x1 || r.y2 <= r.y1 )
+            continue;
+
+        if ( !found )
+        {
+            left = r.x1;
+            top = r.y1;
+            right = r.x2;
+            bottom = r.y2;
+            found = true;
+        }
+        else
+        {
+            left = std::min(left, r.x1);
+            top = std::min(top, r.y1);
+            right = std::max(right, r.x2);
+            bottom = std::max(bottom, r.y2);
+        }
+    }
+
+    if ( !found )
+        return wxRect2DDouble(0, 0, 0, 0);
+
+    return wxRect2DDouble(left, top, right - left, bottom - top);
+}
+
+static VirtualDocument preprocess_worksheets(PopplerDocument *doc)
+{
+    struct WorksheetRegion
+    {
+        wxString label;
+        double top;
+    };
+
+    VirtualDocument pages;
+    const int count = poppler_document_get_n_pages(doc);
+    for ( int page_idx = 0; page_idx < count; ++page_idx )
+    {
+        PopplerPage *page = poppler_document_get_page(doc, page_idx);
+        double page_width = 0, page_height = 0;
+        poppler_page_get_size(page, &page_width, &page_height);
+
+        gchar *text_raw = poppler_page_get_text(page);
+        PopplerRectangle *rects = NULL;
+        guint rect_count = 0;
+        poppler_page_get_text_layout(page, &rects, &rect_count);
+
+        wxString page_text = wxString::FromUTF8(text_raw ? text_raw : "");
+        std::vector<WorksheetRegion> regions;
+        wxStringTokenizer tokenizer(page_text, "\n", wxTOKEN_RET_EMPTY_ALL);
+        int char_offset = 0;
+        while ( tokenizer.HasMoreTokens() )
+        {
+            wxString line = tokenizer.GetNextToken();
+            int line_chars = line.length();
+            if ( is_worksheet_header(line) )
+            {
+                wxRect2DDouble bounds = char_range_bounds(rects, rect_count, char_offset, char_offset + line_chars);
+                if ( bounds.m_height > 0 )
+                {
+                    WorksheetRegion region;
+                    region.label = normalize_worksheet_label(line);
+                    region.top = bounds.m_y;
+                    regions.push_back(region);
+                }
+            }
+            char_offset += line_chars + 1;
+        }
+
+        std::sort(regions.begin(), regions.end(),
+                  [](const WorksheetRegion& lhs, const WorksheetRegion& rhs)
+                  {
+                      return lhs.top < rhs.top;
+                  });
+
+        for ( size_t i = 0; i < regions.size(); ++i )
+        {
+            VirtualPage out;
+            out.source_page = page;
+            out.is_blank = false;
+            out.page_width = page_width;
+            out.page_height = std::max(1.0, (i + 1 < regions.size() ? regions[i + 1].top : page_height) - regions[i].top);
+            out.clip_x = 0.0;
+            out.clip_y = regions[i].top;
+            out.clip_width = page_width;
+            out.clip_height = out.page_height;
+            out.label = regions[i].label;
+            pages.push_back(out);
+        }
+
+        if ( text_raw )
+            g_free(text_raw);
+        if ( rects )
+            g_free(rects);
+        g_object_unref(page);
+    }
+
+    return pages;
+}
+
+static VirtualDocument align_virtual_documents(const VirtualDocument& source,
+                                               const std::vector<wxString>& order,
+                                               const std::map<wxString, VirtualPage>& lookup,
+                                               const std::map<wxString, wxSize>& dimensions)
+{
+    VirtualDocument aligned;
+    for ( std::vector<wxString>::const_iterator it = order.begin(); it != order.end(); ++it )
+    {
+        std::map<wxString, VirtualPage>::const_iterator found = lookup.find(*it);
+        if ( found != lookup.end() )
+        {
+            aligned.push_back(found->second);
+            continue;
+        }
+
+        VirtualPage blank;
+        blank.label = *it;
+        std::map<wxString, wxSize>::const_iterator dim = dimensions.find(*it);
+        if ( dim != dimensions.end() )
+        {
+            blank.page_width = dim->second.x;
+            blank.page_height = dim->second.y;
+            blank.clip_width = dim->second.x;
+            blank.clip_height = dim->second.y;
+        }
+        else if ( !source.empty() )
+        {
+            blank.page_width = source[0].page_width;
+            blank.page_height = source[0].page_height;
+            blank.clip_width = source[0].page_width;
+            blank.clip_height = source[0].page_height;
+        }
+        aligned.push_back(blank);
+    }
+
+    return aligned;
+}
+
 inline unsigned char to_grayscale(unsigned char r, unsigned char g, unsigned char b)
 {
     return (unsigned char)(0.2126 * r + 0.7152 * g + 0.0722 * b);
+}
+
+cairo_surface_t *render_virtual_page(const VirtualPage& page)
+{
+    const int w_px = int((int)g_resolution * page.page_width / 72.0);
+    const int h_px = int((int)g_resolution * page.page_height / 72.0);
+
+    cairo_surface_t *surface =
+        cairo_image_surface_create(CAIRO_FORMAT_RGB24, std::max(1, w_px), std::max(1, h_px));
+
+    cairo_t *cr = cairo_create(surface);
+    cairo_set_source_rgb(cr, 1, 1, 1);
+    cairo_paint(cr);
+
+    if ( !page.is_blank && page.source_page )
+    {
+        cairo_scale(cr, (int)g_resolution / 72.0, (int)g_resolution / 72.0);
+        cairo_translate(cr, -page.clip_x, -page.clip_y);
+        poppler_page_render(page.source_page, cr);
+    }
+
+    cairo_show_page(cr);
+    cairo_destroy(cr);
+    return surface;
 }
 
 cairo_surface_t *render_page(PopplerPage *page)
@@ -594,6 +815,124 @@ bool page_compare(int page, cairo_t *cr_out,
         cairo_surface_destroy(img2);
 
     return !has_diff;
+}
+
+bool virtual_page_compare(int page, cairo_t *cr_out,
+                          const VirtualPage& page1,
+                          const VirtualPage& page2)
+{
+    cairo_surface_t *img1 = render_virtual_page(page1);
+    cairo_surface_t *img2 = render_virtual_page(page2);
+
+    DiffRegions diff_regions;
+    cairo_surface_t *diff = diff_images(page, img1, img2, 0, 0,
+                                        NULL, -1,
+                                        g_side_by_side ? &diff_regions : NULL);
+    const bool has_diff = (diff != NULL);
+
+    cairo_surface_t *output_surface = NULL;
+    if ( g_side_by_side )
+        output_surface = compose_side_by_side(img1, img2, &diff_regions);
+    else if ( diff )
+        output_surface = diff;
+    else
+        output_surface = img1;
+
+    if ( cr_out )
+    {
+        cairo_save(cr_out);
+        cairo_scale(cr_out, 72.0 / g_resolution, 72.0 / g_resolution);
+        cairo_set_source_surface(cr_out, output_surface, 0, 0);
+        cairo_paint(cr_out);
+        cairo_restore(cr_out);
+        cairo_show_page(cr_out);
+    }
+
+    if ( output_surface && output_surface != diff && output_surface != img1 && output_surface != img2 )
+        cairo_surface_destroy(output_surface);
+    if ( diff )
+        cairo_surface_destroy(diff);
+    cairo_surface_destroy(img1);
+    cairo_surface_destroy(img2);
+    return !has_diff;
+}
+
+static void render_toc_page(cairo_t *cr_out,
+                            cairo_surface_t *surface_out,
+                            const std::vector<wxString>& labels)
+{
+    const double width = 595.0;
+    const double height = 842.0;
+    cairo_pdf_surface_set_size(surface_out, width, height);
+    cairo_select_font_face(cr_out, "Sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
+    cairo_set_font_size(cr_out, 18.0);
+    cairo_move_to(cr_out, 50.0, 50.0);
+    cairo_show_text(cr_out, "Worksheet Table of Contents");
+
+    cairo_select_font_face(cr_out, "Sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
+    cairo_set_font_size(cr_out, 12.0);
+    double y = 85.0;
+    for ( size_t i = 0; i < labels.size(); ++i )
+    {
+        if ( y > height - 40.0 )
+        {
+            cairo_show_page(cr_out);
+            cairo_pdf_surface_set_size(surface_out, width, height);
+            y = 50.0;
+        }
+
+        wxString line = wxString::Format("%d. %s", (int)i + 1, labels[i]);
+        cairo_move_to(cr_out, 50.0, y);
+        cairo_show_text(cr_out, line.utf8_str());
+        y += 18.0;
+    }
+    cairo_show_page(cr_out);
+}
+
+bool virtual_doc_compare(const VirtualDocument& doc1,
+                         const VirtualDocument& doc2,
+                         const std::vector<wxString>& labels,
+                         const char *pdf_output)
+{
+    int pages_differ = 0;
+    cairo_surface_t *surface_out = NULL;
+    cairo_t *cr_out = NULL;
+
+    if ( pdf_output )
+    {
+        surface_out = cairo_pdf_surface_create(pdf_output, 1, 1);
+        cr_out = cairo_create(surface_out);
+        if ( g_add_worksheet_toc )
+            render_toc_page(cr_out, surface_out, labels);
+    }
+
+    for ( size_t page = 0; page < doc1.size() && page < doc2.size(); ++page )
+    {
+        if ( pdf_output )
+        {
+            const double separator = g_side_by_side ? 72.0 * 10.0 / g_resolution : 0.0;
+            const double width = g_side_by_side
+                                 ? (doc1[page].page_width + doc2[page].page_width + separator)
+                                 : std::max(doc1[page].page_width, doc2[page].page_width);
+            const double height = std::max(doc1[page].page_height, doc2[page].page_height);
+            cairo_pdf_surface_set_size(surface_out, width, height);
+        }
+
+        if ( !virtual_page_compare(page, cr_out, doc1[page], doc2[page]) )
+        {
+            ++pages_differ;
+            if ( g_verbose )
+                printf("worksheet page %d differs: %s\n", (int)page + 1, labels[page].utf8_str());
+        }
+    }
+
+    if ( pdf_output )
+    {
+        cairo_destroy(cr_out);
+        cairo_surface_destroy(surface_out);
+    }
+
+    return pages_differ == 0;
 }
 
 
@@ -1152,6 +1491,12 @@ int main(int argc, char *argv[])
         { wxCMD_LINE_SWITCH,
                   NULL, "side-by-side", "output rasterized pages side-by-side and highlight differing regions with semi-transparent red overlays" },
 
+        { wxCMD_LINE_SWITCH,
+                  NULL, "align-worksheets", "split pages by worksheet header lines, align same-named worksheets and pad missing ones with blank pages before comparing" },
+
+        { wxCMD_LINE_SWITCH,
+                  NULL, "worksheet-toc", "when used with --align-worksheets and --output-diff, prepend a table-of-contents page listing worksheet names" },
+
         { wxCMD_LINE_PARAM,
                   NULL, NULL, "file1.pdf", wxCMD_LINE_VAL_STRING },
         { wxCMD_LINE_PARAM,
@@ -1188,6 +1533,12 @@ int main(int argc, char *argv[])
 
     if ( parser.Found("side-by-side") )
         g_side_by_side = true;
+
+    if ( parser.Found("align-worksheets") )
+        g_align_worksheets = true;
+
+    if ( parser.Found("worksheet-toc") )
+        g_add_worksheet_toc = true;
 
     wxFileName file1(parser.GetParam(0));
     wxFileName file2(parser.GetParam(1));
@@ -1242,17 +1593,60 @@ int main(int argc, char *argv[])
     int retval = 0;
 
     wxString pdf_file;
-    if ( parser.Found("output-diff", &pdf_file) )
+    if ( g_align_worksheets )
+    {
+        VirtualDocument worksheets1 = preprocess_worksheets(doc1);
+        VirtualDocument worksheets2 = preprocess_worksheets(doc2);
+        if ( worksheets1.empty() && worksheets2.empty() )
+        {
+            fprintf(stderr, "No worksheet headers matching 'POU:..., 工作单:...' were found; falling back to normal page-by-page comparison.\n");
+            g_align_worksheets = false;
+        }
+        else
+        {
+            std::vector<wxString> order;
+            std::set<wxString> seen;
+            std::map<wxString, VirtualPage> lookup1, lookup2;
+            std::map<wxString, wxSize> dimensions;
+
+            for ( size_t i = 0; i < worksheets1.size(); ++i )
+            {
+                lookup1[worksheets1[i].label] = worksheets1[i];
+                dimensions[worksheets1[i].label] = wxSize((int)worksheets1[i].page_width, (int)worksheets1[i].page_height);
+            }
+            for ( size_t i = 0; i < worksheets2.size(); ++i )
+            {
+                lookup2[worksheets2[i].label] = worksheets2[i];
+                dimensions[worksheets2[i].label] = wxSize((int)worksheets2[i].page_width, (int)worksheets2[i].page_height);
+                if ( seen.insert(worksheets2[i].label).second )
+                    order.push_back(worksheets2[i].label);
+            }
+            for ( size_t i = 0; i < worksheets1.size(); ++i )
+            {
+                if ( seen.insert(worksheets1[i].label).second )
+                    order.push_back(worksheets1[i].label);
+            }
+
+            VirtualDocument aligned1 = align_virtual_documents(worksheets1, order, lookup1, dimensions);
+            VirtualDocument aligned2 = align_virtual_documents(worksheets2, order, lookup2, dimensions);
+
+            if ( parser.Found("output-diff", &pdf_file) )
+                retval = virtual_doc_compare(aligned1, aligned2, order, pdf_file.utf8_str()) ? 0 : 1;
+            else
+                retval = virtual_doc_compare(aligned1, aligned2, order, NULL) ? 0 : 1;
+        }
+    }
+    if ( !g_align_worksheets && parser.Found("output-diff", &pdf_file) )
     {
         retval = doc_compare(doc1, doc2, pdf_file.utf8_str(), NULL) ? 0 : 1;
     }
-    else if ( parser.Found("view") )
+    else if ( !g_align_worksheets && parser.Found("view") )
     {
         wxGetApp().SetData(parser.GetParam(0), doc1,
                            parser.GetParam(1), doc2);
         retval = wxEntry(argc, argv);
     }
-    else
+    else if ( !g_align_worksheets )
     {
         retval = doc_compare(doc1, doc2, NULL, NULL) ? 0 : 1;
     }
