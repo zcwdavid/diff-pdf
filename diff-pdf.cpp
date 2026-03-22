@@ -114,10 +114,15 @@ struct TextBounds
     }
 };
 
+static wxString utf8_string(const char *text)
+{
+    return wxString::FromUTF8(text);
+}
+
 static wxString normalize_worksheet_label(const wxString& line)
 {
     wxString normalized(line);
-    normalized.Replace("：", ":");
+    normalized.Replace(utf8_string("\xEF\xBC\x9A"), ":");
     normalized.Replace("\t", " ");
     while ( normalized.Replace("  ", " ") ) {}
     return normalized.Trim(true).Trim(false);
@@ -127,7 +132,7 @@ static bool is_worksheet_header(const wxString& line)
 {
     const wxString normalized = normalize_worksheet_label(line);
     return normalized.Find("POU:") != wxNOT_FOUND &&
-           normalized.Find("工作单:") != wxNOT_FOUND;
+           normalized.Find(utf8_string("\xE5\xB7\xA5\xE4\xBD\x9C\xE5\x8D\x95:")) != wxNOT_FOUND;
 }
 
 static TextBounds char_range_bounds(PopplerRectangle *rects, guint rect_count,
