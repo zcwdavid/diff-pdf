@@ -96,6 +96,24 @@ struct DiffRegions
     std::vector<wxRect> page2;
 };
 
+struct TextBounds
+{
+    double x;
+    double y;
+    double width;
+    double height;
+
+    TextBounds()
+        : x(0.0), y(0.0), width(0.0), height(0.0)
+    {
+    }
+
+    TextBounds(double x_, double y_, double width_, double height_)
+        : x(x_), y(y_), width(width_), height(height_)
+    {
+    }
+};
+
 static wxString normalize_worksheet_label(const wxString& line)
 {
     wxString normalized(line);
@@ -112,8 +130,8 @@ static bool is_worksheet_header(const wxString& line)
            normalized.Find("工作单:") != wxNOT_FOUND;
 }
 
-static wxRect2DDouble char_range_bounds(PopplerRectangle *rects, guint rect_count,
-                                        int first_char, int last_char)
+static TextBounds char_range_bounds(PopplerRectangle *rects, guint rect_count,
+                                    int first_char, int last_char)
 {
     bool found = false;
     double left = 0, top = 0, right = 0, bottom = 0;
@@ -143,9 +161,9 @@ static wxRect2DDouble char_range_bounds(PopplerRectangle *rects, guint rect_coun
     }
 
     if ( !found )
-        return wxRect2DDouble(0, 0, 0, 0);
+        return TextBounds(0, 0, 0, 0);
 
-    return wxRect2DDouble(left, top, right - left, bottom - top);
+    return TextBounds(left, top, right - left, bottom - top);
 }
 
 static VirtualDocument preprocess_worksheets(PopplerDocument *doc)
@@ -179,12 +197,12 @@ static VirtualDocument preprocess_worksheets(PopplerDocument *doc)
             int line_chars = line.length();
             if ( is_worksheet_header(line) )
             {
-                wxRect2DDouble bounds = char_range_bounds(rects, rect_count, char_offset, char_offset + line_chars);
-                if ( bounds.m_height > 0 )
+                TextBounds bounds = char_range_bounds(rects, rect_count, char_offset, char_offset + line_chars);
+                if ( bounds.height > 0 )
                 {
                     WorksheetRegion region;
                     region.label = normalize_worksheet_label(line);
-                    region.top = bounds.m_y;
+                    region.top = bounds.y;
                     regions.push_back(region);
                 }
             }
