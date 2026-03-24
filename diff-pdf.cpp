@@ -57,6 +57,12 @@ bool g_side_by_side = false;
 #define DEFAULT_RESOLUTION 300
 long g_resolution = DEFAULT_RESOLUTION;
 
+struct DiffRegions
+{
+    std::vector<wxRect> page1;
+    std::vector<wxRect> page2;
+};
+
 inline unsigned char to_grayscale(unsigned char r, unsigned char g, unsigned char b)
 {
     return (unsigned char)(0.2126 * r + 0.7152 * g + 0.0722 * b);
@@ -96,13 +102,62 @@ cairo_surface_t *render_page(PopplerPage *page)
     return surface;
 }
 
+static void add_diff_region(std::vector<wxRect>& regions, const wxRect& rect)
+{
+    wxRect merged(rect);
+
+    for ( std::vector<wxRect>::iterator it = regions.begin(); it != regions.end(); )
+    {
+        wxRect expanded(*it);
+        expanded.Inflate(2, 2);
+
+        if ( expanded.Intersects(merged) )
+        {
+            merged.Union(*it);
+            it = regions.erase(it);
+        }
+        else
+        {
+            ++it;
+        }
+    }
+
+    regions.push_back(merged);
+}
+
+static void add_nonoverlap_regions(std::vector<wxRect>& regions,
+                                   const wxRect& source,
+                                   const wxRect& overlap)
+{
+    if ( overlap.GetTop() > source.GetTop() )
+        add_diff_region(regions,
+                        wxRect(source.x, source.y,
+                               source.width, overlap.GetTop() - source.GetTop()));
+
+    if ( overlap.GetBottom() < source.GetBottom() )
+        add_diff_region(regions,
+                        wxRect(source.x, overlap.GetBottom() + 1,
+                               source.width, source.GetBottom() - overlap.GetBottom()));
+
+    if ( overlap.GetLeft() > source.GetLeft() )
+        add_diff_region(regions,
+                        wxRect(source.x, overlap.y,
+                               overlap.GetLeft() - source.GetLeft(), overlap.height));
+
+    if ( overlap.GetRight() < source.GetRight() )
+        add_diff_region(regions,
+                        wxRect(overlap.GetRight() + 1, overlap.y,
+                               source.GetRight() - overlap.GetRight(), overlap.height));
+}
+
 
 // Creates image of differences between s1 and s2. If the offset is specified,
 // then s2 is displaced by it. If thumbnail and thumbnail_width are specified,
 // then a thumbnail with highlighted differences is created too.
 cairo_surface_t *diff_images(int page, cairo_surface_t *s1, cairo_surface_t *s2,
                              int offset_x = 0, int offset_y = 0,
-                             wxImage *thumbnail = NULL, int thumbnail_width = -1)
+                             wxImage *thumbnail = NULL, int thumbnail_width = -1,
+                             DiffRegions *diff_regions = NULL)
 {
     assert( s1 || s2 );
 
@@ -128,6 +183,29 @@ cairo_surface_t *diff_images(int page, cairo_surface_t *s1, cairo_surface_t *s2,
     r1.Offset(-rdiff.x, -rdiff.y);
     r2.Offset(-rdiff.x, -rdiff.y);
     rdiff.Offset(-rdiff.x, -rdiff.y);
+
+    if ( diff_regions && s1 && s2 )
+    {
+        wxRect overlap(r1);
+        overlap.Intersect(r2);
+
+        if ( !overlap.IsEmpty() )
+        {
+            add_nonoverlap_regions(diff_regions->page1,
+                                   wxRect(0, 0, r1.width, r1.height),
+                                   wxRect(overlap.x - r1.x, overlap.y - r1.y,
+                                          overlap.width, overlap.height));
+            add_nonoverlap_regions(diff_regions->page2,
+                                   wxRect(0, 0, r2.width, r2.height),
+                                   wxRect(overlap.x - r2.x, overlap.y - r2.y,
+                                          overlap.width, overlap.height));
+        }
+        else
+        {
+            add_diff_region(diff_regions->page1, wxRect(0, 0, r1.width, r1.height));
+            add_diff_region(diff_regions->page2, wxRect(0, 0, r2.width, r2.height));
+        }
+    }
 
     bool changes = false;
 
@@ -192,9 +270,40 @@ cairo_surface_t *diff_images(int page, cairo_surface_t *s1, cairo_surface_t *s2,
               y++, data2 += stride2, out += stridediff )
         {
             bool linediff = false;
+            int run_start = -1;
+
+            auto flush_diff_run = [&](int run_end)
+            {
+                if ( run_start == -1 || !diff_regions )
+                    return;
+
+                const int out_x = r2.x + run_start;
+                const int out_y = r2.y + y;
+                const int width = run_end - run_start + 1;
+
+                add_diff_region(diff_regions->page2, wxRect(run_start, y, width, 1));
+
+                if ( s1 )
+                {
+                    const int left = out_x - r1.x;
+                    const int right = left + width;
+                    const int clipped_left = std::max(0, left);
+                    const int clipped_right = std::min(r1.width, right);
+
+                    if ( clipped_left < clipped_right && out_y >= r1.y && out_y < r1.y + r1.height )
+                    {
+                        add_diff_region(diff_regions->page1,
+                                        wxRect(clipped_left, out_y - r1.y,
+                                               clipped_right - clipped_left, 1));
+                    }
+                }
+
+                run_start = -1;
+            };
 
             for ( int x = 0; x < r2.width * 4; x += 4 )
             {
+                const int pixel_x = x / 4;
                 unsigned char cr1 = *(out + x + 0);
                 unsigned char cg1 = *(out + x + 1);
                 unsigned char cb1 = *(out + x + 2);
@@ -208,6 +317,9 @@ cairo_surface_t *diff_images(int page, cairo_surface_t *s1, cairo_surface_t *s2,
                   || cb1 > (cb2+g_channel_tolerance) || cb1 < (cb2-g_channel_tolerance)
                    )
                 {
+                    if ( run_start == -1 )
+                        run_start = pixel_x;
+
                     pixel_diff_count++;
                     changes = true;
                     linediff = true;
@@ -228,6 +340,10 @@ cairo_surface_t *diff_images(int page, cairo_surface_t *s1, cairo_surface_t *s2,
                         thumbnail->SetRGB(tx, ty, 255, 0, 0);
                     }
                 }
+                else
+                {
+                    flush_diff_run(pixel_x - 1);
+                }
 
                 if (g_grayscale)
                 {
@@ -244,6 +360,8 @@ cairo_surface_t *diff_images(int page, cairo_surface_t *s1, cairo_surface_t *s2,
                     *(out + x + 2) = cb2;
                 }
             }
+
+            flush_diff_run(r2.width - 1);
 
             if (g_mark_differences && linediff)
             {
@@ -333,7 +451,31 @@ cairo_surface_t *diff_images(int page, cairo_surface_t *s1, cairo_surface_t *s2,
 }
 
 
-cairo_surface_t *compose_side_by_side(cairo_surface_t *s1, cairo_surface_t *s2)
+static void draw_diff_regions(cairo_t *cr,
+                              const std::vector<wxRect>& regions,
+                              int x_offset)
+{
+    cairo_save(cr);
+    cairo_set_line_width(cr, 2.0);
+
+    for ( std::vector<wxRect>::const_iterator it = regions.begin(); it != regions.end(); ++it )
+    {
+        cairo_rectangle(cr,
+                        x_offset + it->x + 0.5,
+                        it->y + 0.5,
+                        it->width,
+                        it->height);
+        cairo_set_source_rgba(cr, 1.0, 0.0, 0.0, 0.22);
+        cairo_fill_preserve(cr);
+        cairo_set_source_rgba(cr, 0.85, 0.0, 0.0, 0.9);
+        cairo_stroke(cr);
+    }
+
+    cairo_restore(cr);
+}
+
+cairo_surface_t *compose_side_by_side(cairo_surface_t *s1, cairo_surface_t *s2,
+                                      const DiffRegions *diff_regions = NULL)
 {
     assert( s1 || s2 );
 
@@ -372,6 +514,12 @@ cairo_surface_t *compose_side_by_side(cairo_surface_t *s1, cairo_surface_t *s2)
         cairo_fill(cr);
     }
 
+    if ( diff_regions )
+    {
+        draw_diff_regions(cr, diff_regions->page1, 0);
+        draw_diff_regions(cr, diff_regions->page2, width1 + separator_width);
+    }
+
     cairo_destroy(cr);
 
     return combined;
@@ -389,15 +537,17 @@ bool page_compare(int page, cairo_t *cr_out,
     cairo_surface_t *img1 = page1 ? render_page(page1) : NULL;
     cairo_surface_t *img2 = page2 ? render_page(page2) : NULL;
 
+    DiffRegions diff_regions;
     cairo_surface_t *diff = diff_images(page, img1, img2, 0, 0,
-                                        thumbnail, thumbnail_width);
+                                        thumbnail, thumbnail_width,
+                                        g_side_by_side ? &diff_regions : NULL);
     const bool has_diff = (diff != NULL);
 
     cairo_surface_t *output_surface = NULL;
     if ( g_side_by_side )
     {
         if ( !g_skip_identical || has_diff || !cr_out )
-            output_surface = compose_side_by_side(img1, img2);
+            output_surface = compose_side_by_side(img1, img2, &diff_regions);
     }
     else if ( diff )
         output_surface = diff;
@@ -1000,7 +1150,7 @@ int main(int argc, char *argv[])
                   NULL, "view", "view the differences in a window" },
 
         { wxCMD_LINE_SWITCH,
-                  NULL, "side-by-side", "output rasterized pages side-by-side instead of overlaying them" },
+                  NULL, "side-by-side", "output rasterized pages side-by-side and highlight differing regions with semi-transparent red overlays" },
 
         { wxCMD_LINE_PARAM,
                   NULL, NULL, "file1.pdf", wxCMD_LINE_VAL_STRING },
